@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>stock-multiagent 架构图</title>
+<style>
+  body { margin:0; padding:28px 22px; font-family:-apple-system,"PingFang SC",sans-serif;
+          background:#faf9fc; color:#222; }
+  h1 { font-size:19px; margin:0 0 4px; }
+  .sub { color:#777; font-size:13px; margin-bottom:20px; }
+  #box { background:#fff; border:1px solid #e6e2f0; border-radius:10px; padding:22px;
+          box-shadow:0 1px 4px rgba(90,70,150,.06); overflow:auto; }
+  details { margin-top:18px; }
+  summary { cursor:pointer; color:#5a4a96; font-size:13px; }
+  pre { background:#f4f2fa; padding:12px; border-radius:8px; font-size:12px; overflow:auto; }
+  .err { color:#b00; font-size:13px; }
+</style>
+</head>
+<body>
+  <h1>stock-multiagent · 多 Agent 复盘流水线</h1>
+  <div class="sub">4 视角分析师并行扇出 → Supervisor 汇总 → 执笔 → 反方审查 → 人工确认；含打回重写回路与熔断</div>
+  <div id="box"><pre class="mermaid">graph TD;
+	__start__([&lt;p&gt;__start__&lt;/p&gt;]):::first
+	collect_facts(collect_facts)
+	analyst_sentiment(analyst_sentiment)
+	analyst_leader(analyst_leader)
+	analyst_handover(analyst_handover)
+	analyst_sector(analyst_sector)
+	supervisor(supervisor)
+	analyze(analyze)
+	critique(critique)
+	human_review(human_review)
+	__end__([&lt;p&gt;__end__&lt;/p&gt;]):::last
+	__start__ --&gt; collect_facts;
+	analyst_handover --&gt; supervisor;
+	analyst_leader --&gt; supervisor;
+	analyst_sector --&gt; supervisor;
+	analyst_sentiment --&gt; supervisor;
+	analyze --&gt; critique;
+	collect_facts --&gt; analyst_handover;
+	collect_facts --&gt; analyst_leader;
+	collect_facts --&gt; analyst_sector;
+	collect_facts --&gt; analyst_sentiment;
+	critique -. &amp;nbsp;rewrite&amp;nbsp; .-&gt; analyze;
+	critique -. &amp;nbsp;human&amp;nbsp; .-&gt; human_review;
+	human_review -. &amp;nbsp;end&amp;nbsp; .-&gt; __end__;
+	human_review -. &amp;nbsp;rewrite&amp;nbsp; .-&gt; analyze;
+	supervisor --&gt; analyze;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc</pre></div>
+
+  <details>
+    <summary>查看 mermaid 源码</summary>
+    <pre>---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([&lt;p&gt;__start__&lt;/p&gt;]):::first
+	collect_facts(collect_facts)
+	analyst_sentiment(analyst_sentiment)
+	analyst_leader(analyst_leader)
+	analyst_handover(analyst_handover)
+	analyst_sector(analyst_sector)
+	supervisor(supervisor)
+	analyze(analyze)
+	critique(critique)
+	human_review(human_review)
+	__end__([&lt;p&gt;__end__&lt;/p&gt;]):::last
+	__start__ --&gt; collect_facts;
+	analyst_handover --&gt; supervisor;
+	analyst_leader --&gt; supervisor;
+	analyst_sector --&gt; supervisor;
+	analyst_sentiment --&gt; supervisor;
+	analyze --&gt; critique;
+	collect_facts --&gt; analyst_handover;
+	collect_facts --&gt; analyst_leader;
+	collect_facts --&gt; analyst_sector;
+	collect_facts --&gt; analyst_sentiment;
+	critique -. &amp;nbsp;rewrite&amp;nbsp; .-&gt; analyze;
+	critique -. &amp;nbsp;human&amp;nbsp; .-&gt; human_review;
+	human_review -. &amp;nbsp;end&amp;nbsp; .-&gt; __end__;
+	human_review -. &amp;nbsp;rewrite&amp;nbsp; .-&gt; analyze;
+	supervisor --&gt; analyze;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+</pre>
+  </details>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({ startOnLoad: true, theme: 'base',
+      themeVariables: { primaryColor:'#efeaff', primaryBorderColor:'#9c8fd0',
+                         lineColor:'#7b6bb5', fontFamily:'-apple-system,PingFang SC,sans-serif' } });
+  </script>
+</body>
+</html>

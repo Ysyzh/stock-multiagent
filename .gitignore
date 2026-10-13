@@ -13,8 +13,14 @@ __pycache__/
 venv/
 .venv/
 
-# 本项目产物（报告/中间结果）
-out/
+# 本项目产物（报告/中间结果）—— 全部是生成物，重跑脚本即可再生
+out/*
+# 例外：这两份是「成果展示」交付物，入库便于直接查看
+#   注意必须先排除 out/* 再放行文件；直接写 `out/` 是**无法**放行其子项的
+#   （git 规则：父目录被排除时，无法重新包含其中的文件）
+!out/architecture.png
+!out/architecture.html
+!out/DEMO.md
 *.log
 
 # IDE
