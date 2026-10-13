@@ -35,8 +35,11 @@
 **2. reducer 在这里才真正发挥作用。**
 
    `findings` 带 `Annotated[..., operator.add]`。4 个分析师**并行**写同一个字段，
-   reducer 保证它们**追加**而不是互相覆盖。
-   阶段 2 里 reducer 只是个演示；到了并行扇出，**没有它就会丢数据**。
+   reducer 保证它们**追加**合并成一个列表。
+
+   注意别把这件事讲反了（我最初就讲反过）：**没有 reducer 时 LangGraph 会直接抛
+   `InvalidUpdateError`（"Can receive only one value per step"），不会静默丢数据。**
+   所以 reducer 解决的是"**怎么合并**"，不是"防止数据消失"。
 
 **3. 重写只回到 `analyze`，不重跑分析师。**
 
@@ -170,7 +173,12 @@ class ReplayState(TypedDict):
       · 不带 reducer → **覆盖**（facts / digest / report / revision）
 
     ⚠️ `findings` 是本图里 reducer **不可省**的字段：4 个分析师在**同一个超步**
-    里并行写它，没有 reducer 就会互相覆盖，最后只剩一份视角结论。
+    里并行写它。**没有 reducer 的话 LangGraph 会直接抛 `InvalidUpdateError`**
+    （"Can receive only one value per step"）—— 失败得很响，**不是**静默丢数据。
+    reducer 的作用是让并行写入可以**合并**，而不是"防止丢数据"。
+
+    （这条我最初写错过：曾注释成"不会报错、只会静默丢一份"。实测纠正 ——
+      见本文件 `build_graph()` 附近与 README 的 reducer 小节。）
     """
 
     date: str

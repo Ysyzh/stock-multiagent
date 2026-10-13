@@ -54,7 +54,7 @@ graph TD;
 | 设计 | 为什么 |
 |---|---|
 | **事实包切片**（板块级 + 字段级） | 每个视角只看到它需要的信息，4 份切片合计仅 1.21× 全量（人手一份全量是 4×），**省 70%** |
-| **reducer 合并**（`Annotated[..., operator.add]`） | 4 个分析师**并行**写同一字段；没有 reducer 不会报错，只会**静默丢数据** |
+| **reducer 合并**（`Annotated[..., operator.add]`） | 4 个分析师**并行**写同一字段；reducer 决定这些写入**怎么合并**（无 reducer 时 LangGraph 直接抛 `InvalidUpdateError`，fail loudly，不是静默丢数据） |
 | **反方审查员回路** | 独立视角拿成品挑毛病，有问题就打回重写；受 `MAX_REVISIONS` 熔断约束 |
 | **人工确认关**（`interrupt`） | 「生成报告」和「发布报告」是两件事；人的打回有**独立预算**，不被机器熔断吞掉 |
 

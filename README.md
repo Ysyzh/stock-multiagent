@@ -381,8 +381,23 @@ DeepSeek 会自动缓存公共前缀 —— writer 与 critic 共享大段 syste
 
 `findings` 带 `Annotated[..., operator.add]`。4 个分析师**并行**写同一字段：
 
-- 有 reducer → **追加**，4 份都在；
-- 没 reducer → **覆盖**，只剩最后写入的那 1 份，而且**不会报错，只会静默丢数据**。
+- 有 reducer → **合并**（追加），4 份都在：`{'items': ['A','B']}`
+- 没 reducer → **`InvalidUpdateError`**：`Can receive only one value per step`
+
+> ⚠️ **这里我最初写错过，值得记一笔。** 我原先注释成"没 reducer 不会报错、
+> 只会静默丢数据"，听起来更可怕 —— 但**实测是直接报错**：
+>
+> ```
+> langgraph.errors.InvalidUpdateError: At key 'items':
+>   Can receive only one value per step. Use an Annotated key to handle multiple values.
+> ```
+>
+> 也就是说 reducer 解决的是「**并行写入怎么合并**」，而不是「防止数据消失」。
+> LangGraph 在这件事上是 **fail loudly**，比静默丢数据好得多。
+>
+> 教训：**"框架在某个边界条件下会怎么表现"这种话，必须实测过才能写。**
+> 我当时是凭"如果没写 reducer 会怎样"的直觉推的，方向错了 ——
+> 把"更安全的报错"讲成了"更危险的静默失败"。
 
 `test_reflection.py` 里专门有一条断言兜这个：
 `4 份视角结论全部保留（reducer 生效，实收 4）` + `视角标签各不相同（无覆盖）`。
