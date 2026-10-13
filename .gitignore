@@ -1,0 +1,24 @@
+# 环境变量（含 API Key，绝对不能提交）
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+venv/
+.venv/
+
+# 本项目产物（报告/中间结果）
+out/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
