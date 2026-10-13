@@ -260,19 +260,22 @@ def estimate_cost(usage: dict) -> float | None:
 # ════════════════════════════════════════════════════════════
 
 def save_artifacts(app, final: dict, date: str) -> list[Path]:
+    """落盘产物。允许"部分状态"—— LLM 失败时也要保住取数成果。"""
     OUT_DIR.mkdir(exist_ok=True)
     written: list[Path] = []
 
-    p = OUT_DIR / f"review-{date}.md"
-    p.write_text(final["report"], encoding="utf-8")
-    written.append(p)
+    # 报告可能不存在（analyze 失败），此时跳过而不是写一个空文件
+    if final.get("report"):
+        p = OUT_DIR / f"review-{date}.md"
+        p.write_text(final["report"], encoding="utf-8")
+        written.append(p)
 
     p = OUT_DIR / f"facts-{date}.json"
     p.write_text(json.dumps({
         "date": date,
-        "facts": final["facts"],
-        "checks": final["checks"],
-        "limitations": final["limitations"],
+        "facts": final.get("facts", {}),
+        "checks": final.get("checks", {}),
+        "limitations": final.get("limitations", []),
         "usage": final.get("usage"),
         "cost_yuan": estimate_cost(final.get("usage") or {}),
         "trace": final.get("trace"),
@@ -296,10 +299,45 @@ def run(date: str = DEFAULT_DATE) -> dict:
     return app.invoke({"date": date})
 
 
+def _diagnose(err: Exception) -> None:
+    """把异常翻译成人能看懂的一句话，而不是甩 50 行 traceback。"""
+    msg = str(err)
+    print(f"\n❌ 分析失败：{type(err).__name__}")
+    low = msg.lower()
+    if "401" in msg or "authentication" in low:
+        print("   原因：API Key 无效，或还是 .env.example 里的占位符。")
+        print("   处理：nano .env  → 把 DEEPSEEK_API_KEY= 右边换成你的真实 key")
+    elif any(k in msg for k in ("Connection", "Timeout", "timed out", "getaddrinfo")):
+        print("   原因：连不上端点。检查网络，或核对 .env 里的 DEEPSEEK_BASE_URL。")
+    elif "429" in msg or "rate limit" in low:
+        print("   原因：触发限流。稍等再试。")
+    else:
+        print(f"   {msg[:400]}")
+
+
+def _print_run_summary(final: dict, elapsed: float) -> None:
+    print("\n[执行轨迹]")
+    for step in final.get("trace", []):
+        mark = "💰" if step.get("llm_calls") else "🧮"
+        extra = {k: v for k, v in step.items() if k not in ("step", "elapsed_s")}
+        print(f"  {mark} {step['step']:14} {step['elapsed_s']:>6.3f}s  {extra}")
+
+    u = final.get("usage") or {}
+    print(f"\n[用量] model={u.get('model')}  in={u.get('input_tokens')}  "
+          f"out={u.get('output_tokens')}  total={u.get('total_tokens')}")
+    cost = estimate_cost(u)
+    print("[费用] " + ("未配置单价（在 .env 里填 DEEPSEEK_PRICE_*_PER_M 即可估算）"
+                      if cost is None else f"{cost} 元"))
+    print(f"\n[汇总] 工具调用 {sum(s.get('tools_called', 0) for s in final.get('trace', []))} 次，"
+          f"LLM 调用 {sum(s.get('llm_calls', 0) for s in final.get('trace', []))} 次，"
+          f"局限 {len(final.get('limitations', []))} 条，总耗时 {elapsed:.2f}s")
+
+
 def main() -> int:
     if not (PROJECT_DIR / ".env").is_file():
         print("❌ 缺少 .env")
-        print("   请在你自己的终端里执行：cp .env.example .env  然后填入 DEEPSEEK_API_KEY")
+        print("   请在你自己的终端里执行：cp .env.example .env")
+        print("   然后编辑 .env，把 DEEPSEEK_API_KEY= 右边换成你的真实 key")
         return 2
     if not os.getenv("DEEPSEEK_API_KEY"):
         print("❌ .env 里没有 DEEPSEEK_API_KEY")
@@ -315,28 +353,28 @@ def main() -> int:
     print(app.get_graph().draw_mermaid())
 
     t0 = time.time()
-    final = app.invoke({"date": date})
+    final: dict = {}
+    try:
+        # 用 stream_mode="values"：每个节点跑完都给一份**完整状态快照**。
+        # 好处很实际 —— 后面节点失败时，前面节点（取数）的成果不会丢。
+        # 对比 app.invoke()：一抛异常，前面所有成果一起没了（我们实测踩过）。
+        for chunk in app.stream({"date": date}, stream_mode="values"):
+            final = chunk
+    except Exception as e:
+        _diagnose(e)
+        if final.get("trace"):
+            print("\n   ↳ 取数成果已保住，不重跑取数")
+            _print_run_summary(final, time.time() - t0)
+        print("\n[产物]（部分）")
+        for f in save_artifacts(app, final, date):
+            print(f"  {f.relative_to(PROJECT_DIR)}  ({f.stat().st_size} 字节)")
+        return 1
+
     elapsed = time.time() - t0
+    _print_run_summary(final, elapsed)
 
-    print("\n[执行轨迹]")
-    for step in final.get("trace", []):
-        mark = "💰" if step.get("llm_calls") else "🧮"
-        print(f"  {mark} {step['step']:14} {step['elapsed_s']:>6.3f}s  "
-              f"{ {k: v for k, v in step.items() if k not in ('step', 'elapsed_s')} }")
-
-    u = final.get("usage") or {}
-    print(f"\n[用量] model={u.get('model')}  in={u.get('input_tokens')}  "
-          f"out={u.get('output_tokens')}  total={u.get('total_tokens')}")
-    cost = estimate_cost(u)
-    print(f"[费用] {'未配置单价（在 .env 里填 DEEPSEEK_PRICE_*_PER_M 即可估算）' if cost is None else f'{cost} 元'}")
-
-    print(f"\n[汇总] 工具调用 {sum(s.get('tools_called', 0) for s in final.get('trace', []))} 次，"
-          f"LLM 调用 {sum(s.get('llm_calls', 0) for s in final.get('trace', []))} 次，"
-          f"局限 {len(final.get('limitations', []))} 条，总耗时 {elapsed:.2f}s")
-
-    files = save_artifacts(app, final, date)
     print("\n[产物]")
-    for f in files:
+    for f in save_artifacts(app, final, date):
         print(f"  {f.relative_to(PROJECT_DIR)}  ({f.stat().st_size} 字节)")
     return 0
 
