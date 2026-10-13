@@ -48,6 +48,9 @@ DATA_DIR = (
 # 本地快照支持的复盘日。数据是离线固定快照，不能假装能分析任意日期。
 SUPPORTED_DATES = ("2026-10-12",)
 
+# 区间工具的日线分片目录（3052 只 × 88 个交易日，17MB，31 个分片）
+KLINES_DIR = DATA_DIR / "klines"
+
 
 # ════════════════════════════════════════════════════════════
 #  领域规则（出处：股票-领域知识.md）
@@ -463,10 +466,191 @@ def industry_breakdown(date: str = "2026-10-12", min_count: int = 2) -> dict:
 
 
 # ════════════════════════════════════════════════════════════
+#  区间工具 —— 从 17MB 离线日线复算多日序列
+# ════════════════════════════════════════════════════════════
+#
+#  前面 8 个工具都是**单日**的，数据源是 10/12 的池子快照。
+#  这一组是**区间**的，数据源是 `klines/`（3052 只 × 88 个交易日不复权日线）。
+#
+#  两者口径**完全一致**（同一个 is_limit_up、同一个交易日历相邻性校验），
+#  所以区间结果可以直接和已人工核验的 `nodes.json` 对比 —— 这就是 evaluate.py 的基础。
+
+_KLINES_CACHE: dict | None = None
+
+
+def _load_all_klines() -> dict:
+    """读全部 31 个分片，合并成 {symbol: rows}。带缓存（17MB，只读一次）。"""
+    global _KLINES_CACHE
+    if _KLINES_CACHE is None:
+        merged: dict = {}
+        for fp in sorted(KLINES_DIR.glob("batch_*.json")):
+            merged.update(_read_json(fp))
+        _KLINES_CACHE = merged
+    return _KLINES_CACHE
+
+
+def _iter_limit_up_runs(rows: list, code: str):
+    """逐行走一只票的日线，产出 (date, run, is_limit_up)。
+
+    `run` = 截至该日的连续涨停天数。**停牌跨日必须归零**：
+    相邻两根日线在交易日历上不相邻时，说明中间停牌过，
+    停牌前后各一个涨停**不是连板**（对应 `股票分析-交接与问题归档.md` 坑 8）。
+    """
+    cal = trading_calendar()
+    pos = {d: i for i, d in enumerate(cal)}
+    prev_close = None
+    prev_date = None
+    prev_was_limit = False
+    run = 0
+    for row in rows:
+        date, close = row[0], float(row[2])          # [date, open, close, high, low, vol]
+        if prev_close is None:
+            prev_close, prev_date = close, date
+            continue
+        lim = is_limit_up(prev_close, close, code)
+        if lim:
+            # 相邻性校验：上一根日线必须是日历上的前一个交易日
+            adjacent = (prev_date in pos and date in pos
+                        and pos[date] - pos[prev_date] == 1)
+            run = (run + 1) if (adjacent and prev_was_limit) else 1
+        else:
+            run = 0
+        yield date, run, lim
+        prev_close, prev_date, prev_was_limit = close, date, lim
+
+
+def compute_daily_stats(start: str, end: str) -> dict:
+    """复算区间内每日的情绪序列：涨停家数 / 最高连板 / ≥2板家数 / ≥3板家数。
+
+    与 `nodes.json` 的 `daily` 字段一一对应，可直接比对。
+    """
+    kl = _load_all_klines()
+    per_day: dict[str, dict] = {}
+    for sym, rows in kl.items():
+        code = sym[2:] if sym[:2] in ("sh", "sz", "bj") else sym
+        for date, run, lim in _iter_limit_up_runs(rows, code):
+            if not (start <= date <= end):
+                continue
+            d = per_day.setdefault(date, {"count": 0, "max_run": 0, "ge2": 0, "ge3": 0})
+            if lim:
+                d["count"] += 1
+                d["max_run"] = max(d["max_run"], run)
+                if run >= 2:
+                    d["ge2"] += 1
+                if run >= 3:
+                    d["ge3"] += 1
+    daily = [{"date": k, **per_day[k]} for k in sorted(per_day)]
+    return {
+        "daily": daily,
+        "cold_line": _cold_line([x["count"] for x in daily]),
+        "_checks": {
+            "复权口径": "不复权（klines 取的是腾讯不带 qfq 的 day 键）",
+            "涨停判定": "round(前收×1.10+1e-9, 2)，收盘 ≥ 涨停价−0.005",
+            "停牌防护": "交易日历相邻性校验，不相邻则连板归零",
+            "样本": f"{len(kl)} 只 × {len(daily)} 个交易日",
+        },
+        "limitations": [_LIMIT_BOARD,
+                        "区间复算依赖离线日线快照，覆盖 2026-06-01~10-09（分析区间 07-01 起，前 1 个月作连板基准）"],
+    }
+
+
+def _cold_line(counts: list[int]) -> int:
+    """冰点线 = 涨停家数区间最低 20% 分位的阈值。出处：领域卡 §一「情绪冰点」。"""
+    if not counts:
+        return 0
+    s = sorted(counts)
+    return s[max(0, int(len(s) * 0.2) - 1)]
+
+
+def detect_handovers(start: str, end: str, min_run: int = 3, min_cand: int = 2) -> dict:
+    """换龙检测：A 断板（前一日 N 板，N≥min_run）→ B 接力（当日涨停且连板≥min_cand）。
+
+    出处：领域卡 §一「换龙 / 接力」。与 `nodes.json` 的 `events` 字段对应。
+    """
+    kl = _load_all_klines()
+    cal = trading_calendar()
+    pos = {d: i for i, d in enumerate(cal)}
+    # 先建索引：date -> {code: (name?, run)}（klines 不带名称，用 code 即可）
+    day_run: dict[str, dict[str, int]] = {}
+    for sym, rows in kl.items():
+        code = sym[2:] if sym[:2] in ("sh", "sz", "bj") else sym
+        for date, run, lim in _iter_limit_up_runs(rows, code):
+            if lim and run:
+                day_run.setdefault(date, {})[code] = run
+
+    events = []
+    dates = [d for d in sorted(day_run) if start <= d <= end]
+    for date in dates:
+        i = pos.get(date)
+        if i is None or i == 0:
+            continue
+        prev = cal[i - 1]
+        today, yest = day_run.get(date, {}), day_run.get(prev, {})
+        broken = sorted(
+            [{"code": c, "run": yest[c]} for c, r in yest.items()
+             if r >= min_run and c not in today],
+            key=lambda x: (-x["run"], x["code"]),
+        )
+        if not broken:
+            continue
+        cands = sorted([{"code": c, "run": r} for c, r in today.items() if r >= min_cand],
+                       key=lambda x: (-x["run"], x["code"]))
+        if not cands:
+            continue
+        # `A` 取**最强的单只**断板票 —— 与基准 `nodes.json` 的结构保持一致（每日一条、
+        # A 是单只），这样两边才能逐条比对。当天其他断板票不丢，放在 `broken_all` 里。
+        events.append({
+            "date": date, "broken_date": prev,
+            "A": broken[0],
+            "broken_all": broken,
+            "cands": cands,
+            "market_count": len(today),
+            "market_max": max(today.values()) if today else 0,
+        })
+    return {
+        "events": events,
+        "_checks": {"换龙口径": f"前一日 ≥{min_run} 板且当日未涨停 → 当日有 ≥{min_cand} 板接力",
+                    "相邻性": "已用交易日历，前一日取日历前一位",
+                    "样本": f"{len(kl)} 只 × {len(dates)} 个交易日"},
+        "limitations": [_LIMIT_BOARD,
+                        "换龙只认**当天**接力；真实资金接力常发生在断板后 1~2 天（领域卡 §九已知缺口）"],
+    }
+
+
+def rank_high_fliers(start: str, end: str, min_run: int = 4) -> dict:
+    """高标排行：区间内最高连板 ≥ min_run 的个股。对应 `nodes.json` 的 `ranks`。"""
+    kl = _load_all_klines()
+    ranks = []
+    for sym, rows in kl.items():
+        code = sym[2:] if sym[:2] in ("sh", "sz", "bj") else sym
+        best, best_start, best_end, cur_start = 0, None, None, None
+        prev_run = 0
+        for date, run, lim in _iter_limit_up_runs(rows, code):
+            if not (start <= date <= end):
+                continue
+            if lim and run:
+                if prev_run == 0:
+                    cur_start = date
+                if run > best:
+                    best, best_start, best_end = run, cur_start, date
+            prev_run = run if lim else 0
+        if best >= min_run:
+            ranks.append({"code": code, "max_run": best,
+                          "run_start": best_start, "run_end": best_end})
+    ranks.sort(key=lambda x: (-x["max_run"], x["code"]))
+    return {
+        "ranks": ranks,
+        "_checks": {"高标口径": f"区间内最长连续涨停段 ≥ {min_run} 板", "停牌防护": "已校验"},
+        "limitations": [_LIMIT_BOARD],
+    }
+
+
+# ════════════════════════════════════════════════════════════
 #  工具注册表 —— 给 Agent 用的就是这些
 # ════════════════════════════════════════════════════════════
 
 TOOL_REGISTRY = {
+    # 单日（数据源：10/12 池子快照）
     "data_boundaries": data_boundaries,
     "ladder": ladder,
     "seal_strength": seal_strength,
@@ -475,6 +659,10 @@ TOOL_REGISTRY = {
     "blow_up_rate": blow_up_rate,
     "market_breadth": market_breadth,
     "industry_breakdown": industry_breakdown,
+    # 区间（数据源：klines 离线日线，口径与上面完全一致）
+    "compute_daily_stats": compute_daily_stats,
+    "detect_handovers": detect_handovers,
+    "rank_high_fliers": rank_high_fliers,
 }
 
 DATE = "2026-10-12"
