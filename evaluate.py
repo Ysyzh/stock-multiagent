@@ -150,31 +150,46 @@ def compare_events(mine: dict, gt: dict) -> dict:
     # 顺带统计"我方候选更全"的比例
     wider = sum(1 for k in both if len(my[k]["cands"]) > len(g[k]["cands"]))
 
-    # ── 未命中归因：避免把"并列选票差异"误报成"算错" ──
-    # 实测 12 个漏报里 10 个属于此类：同一天、同连板高度，只是并列断板票里
-    # 选了不同的那一只。两种选择都正确，差别只在 tie-break 约定。
-    by_date_my: dict[str, list[dict]] = {}
+    # ── 未命中归因：**按票的身份**归因，而不是只比连板高度 ──
+    #
+    # ⚠️ 这里的第一版写错了，是外部独立审查（让 Claude Code 首次阅读本文件）
+    #    指出来的 —— 值得原样记下：
+    #
+    #    「两条分支都只看『当天我方 A 中是否存在 run==gt_run 的票』，
+    #      不检查那只票是不是 c 本身。若我方把 c 的 run 算错、导致 c 没当上 A，
+    #      只要当天另有一只票高度碰巧相同，就误报『并列选票差异』放过真问题。」
+    #
+    #    也就是说第一版是**循环论证**：它假设了"差异来自 tie-break"，
+    #    而不是验证这件事。实测复现：造一个「我方真的选错票」的场景，
+    #    它会判成"并列选票差异"。
+    #
+    # 修法：改成看**票的身份** ——
+    #   · 基准选的票 c 在我方"当天全部断板票"里 → 我方识别到了它，只是选 A 的约定不同
+    #   · 基准选的票 c **不在**我方断板票里 → 我方漏识别，必须人工核查（可能是真错）
+    by_date_my_all: dict[str, dict[str, int]] = {}   # 日期 → {代码: 连板高度}
     for (d, _c), e in my.items():
-        by_date_my.setdefault(d, []).append(e["A"])
-    by_date_gt: dict[str, list[dict]] = {}
-    for (d, _c), e in g.items():
-        by_date_gt.setdefault(d, []).append(e["A"])
+        codes = {x["code"]: x["run"] for x in (e.get("broken_all") or [e["A"]])}
+        by_date_my_all.setdefault(d, {}).update(codes)
 
-    def classify(d: str, gt_run: int) -> str:
-        mins = by_date_my.get(d, [])
-        if not mins:
-            return "边界（我方无事件）"
-        if any(m["run"] == gt_run for m in mins):
-            return "并列选票差异（同高度，tie-break 约定不同）"
-        if any(m["run"] == gt_run + 1 for m in mins):
-            return "基准 off-by-one 连带（高度差 1）"
-        return "其他（需人工核查）"
+    def classify(d: str, c: str, gt_run: int) -> str:
+        mine_map = by_date_my_all.get(d)
+        if not mine_map:
+            return "边界（我方当日无事件）"
+        if c not in mine_map:
+            return "⚠️ 我方未识别该断板票（需人工核查）"
+        my_run = mine_map[c]
+        if my_run == gt_run:
+            return "并列选票差异（同一只票我方也识别到了，只是没选它当 A）"
+        if my_run == gt_run + 1:
+            return "基准 off-by-one 连带（同一只票，高度差 1）"
+        return f"⚠️ 同一只票高度不符（我方 {my_run} vs 基准 {gt_run}，需核查）"
 
     missed_detail = []
     for d, c in sorted(set(g) - set(my)):
         gt_run = g[(d, c)]["A"]["run"]
         missed_detail.append({"date": d, "A": c, "gt_run": gt_run,
-                              "归因": classify(d, gt_run)})
+                              "我方是否识别到该票": c in (by_date_my_all.get(d) or {}),
+                              "归因": classify(d, c, gt_run)})
     reason: dict[str, int] = {}
     for m in missed_detail:
         reason[m["归因"]] = reason.get(m["归因"], 0) + 1
