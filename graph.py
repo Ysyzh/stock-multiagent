@@ -1,53 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-阶段 3（提前做）：反方审查员 + reflection 回路
+阶段 3：4 个视角分析师并行扇出 + Supervisor 汇总 + Writer 执笔 + 审查回路
 
-图的结构从"一条直线"变成"带循环的分支"：
+完整图（★ 是阶段 3 新增的部分）：
 
-    START → collect_facts → analyze → critique ─┬─(有问题 且 revision < MAX) → analyze
-                                                 └─(通过 或 达上限) ─────────→ END
-
-这 4 行就是 `create_agent()` 内部那个"循环"的本质 ——
-**条件边 + 回到前一个节点**。做完这个，Agent 循环对你就不再是黑盒了。
-
-═══════════════════════════════════════════════════════════
-为什么需要审查员（来自真实实测）
-═══════════════════════════════════════════════════════════
-实测发现三类错误 **数字全对、错在表述层**：
-
-| 错误 | 报告原文 |
-|---|---|
-| 自相矛盾 | 「8 家里有 **5 家**是连板股」，括号里却列出 6 只 |
-| 比较方向反 | 「东百 3.21 亿**仅次于**赛力斯 3.1 亿」（其实东百更大） |
-| 计数错 | 「这 **4** 个高度」（7/8/9 只有 3 个） |
-
-这三类靠"叮嘱分析师仔细点"能压一时，但不可靠。
-需要一个**独立视角**拿着成品挑毛病 —— 而且它只拿到报告 + 事实包，
-**仍不接触原始行情数据**，所以它也不能凭空编造。
+                       ┌──────────────┐
+        START ──► collect_facts       │  确定性取数（无 LLM）
+                       └──────┬───────┘
+             ┌────────────┬───┴────────┬────────────┐   ★ 并行扇出
+             ▼            ▼            ▼            ▼
+      ★ sentiment   ★ leader    ★ handover    ★ sector      4 个视角，各拿一片事实包
+             └────────────┴───┬────────┴────────────┘
+                              ▼
+                       ★ supervisor          汇总：找冲突 / 排优先级 / 指缺口
+                              ▼
+                         analyze              执笔：产出九节报告
+                              ▼
+                         critique ─┬─(不通过且 revision<2)→ analyze
+                                   └─(通过或达上限)───────→ END
 
 ═══════════════════════════════════════════════════════════
-设计决策：取数是确定性的，不让 LLM 决定调哪个工具
+阶段 3 的两个关键设计
 ═══════════════════════════════════════════════════════════
-复盘需要哪些数据是**已知的固定集合**。让 LLM 自己选工具会引入不确定性，
-还可能漏调关键工具导致报告缺项。→ **确定性取数 + LLM 只做解释。**
 
-（对比 my-first-agent：那里是开放式问答，"用户会问什么"不可预知，
-工具选择必须交给 LLM —— 场景不同，选择就不同。）
+**1. 事实包切片 —— 每个分析师只看到它需要的那几块。**
 
-═══════════════════════════════════════════════════════════
+   全量事实包 JSON 约 3.3k 字符。若 4 个分析师人手一份，input 直接 ×4。
+   切片后每个约 1k 字符，代价从"4 倍"降到"1.3 倍"左右。
+
+   > 工程上这句话叫「让每个 Agent 只看到它需要的信息」。
+   > 它同时降低成本和**降低噪音** —— 视角分析师看到无关板块反而会分心。
+
+**2. reducer 在这里才真正发挥作用。**
+
+   `findings` 带 `Annotated[..., operator.add]`。4 个分析师**并行**写同一个字段，
+   reducer 保证它们**追加**而不是互相覆盖。
+   阶段 2 里 reducer 只是个演示；到了并行扇出，**没有它就会丢数据**。
+
+**3. 重写只回到 `analyze`，不重跑分析师。**
+
+   审查意见针对的是**成稿**，4 份视角结论仍然有效。重跑分析师既慢又贵且无必要。
+   （代价写在 README 的取舍说明里：若审查发现某条视角结论本身错了，
+     当前实现不会自动重跑该视角。）
+
 运行
-═══════════════════════════════════════════════════════════
+====
     python3 graph.py                  # 默认复盘日 2026-10-12
-    MAX_REVISIONS=1 python3 graph.py  # 控制最多重写几次（默认 2）
-
-产物（写到 out/，已在 .gitignore 里排除）
-==========================================
-| 文件 | 内容 |
-|---|---|
-| `out/review-<date>.md` | 主报告（含审查通过后的终稿） |
-| `out/facts-<date>.json` | 事实包 + 口径校验 + 局限 + 审查记录 + 用量 |
-| `out/architecture.mmd` | 图的 mermaid 源码（架构图） |
+    MAX_REVISIONS=1 python3 graph.py  # 收紧熔断
 """
 
 from __future__ import annotations
@@ -68,10 +68,14 @@ from pydantic import BaseModel, Field
 
 import tools as T
 from prompts import (
-    ANALYST_SYSTEM,
     CRITIC_SYSTEM,
+    SUPERVISOR_SYSTEM,
+    WRITER_SYSTEM,
     build_critic_prompt,
-    build_user_prompt,
+    build_role_prompt,
+    build_role_system,
+    build_supervisor_prompt,
+    build_writer_prompt,
 )
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -83,9 +87,66 @@ load_dotenv(PROJECT_DIR / ".env")
 DEFAULT_DATE = "2026-10-12"
 MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 TEMPERATURE = float(os.getenv("ANALYST_TEMPERATURE", "0.2"))
-# 最多生成几版报告（1 = 不重写；2 = 允许打回一次）。这是最早的「步数熔断」雏形：
-# 没有它，审查员和分析师可能互相不服，无限循环烧钱。
+# 最多生成几版报告（1 = 不重写）。这是最早的「步数熔断」雏形：
+# 没有它，审查员和执笔人可能互相不服，无限循环烧钱。
 MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "2"))
+
+
+# ════════════════════════════════════════════════════════════
+#  4 个视角的配置 —— 每个视角只拿自己需要的「事实包板块」
+# ════════════════════════════════════════════════════════════
+#  slices 里的名字必须与 collect_facts() 里的板块名一致。
+#  切片是**按板块**切的，不是按字段 —— 这样每个数字仍带着它的 `_checks`，
+#  分析师看到的口径信息不会比全量版少。
+
+ROLE_SPECS: dict[str, dict] = {
+    "sentiment": {
+        "label": "情绪分析师",
+        "focus": "市场情绪温度与宽度：连板高度与梯队断档、炸板率、涨跌分布",
+        "slices": ["数据边界", "连板梯队", "炸板率", "市场宽度", "竞价封板"],
+        # 只需要梯队的高度/家数/个股，不需要每只票的封单与换手明细
+        "drop_ladder_detail": True,
+    },
+    "leader": {
+        "label": "龙头质量分析师",
+        "focus": "封单资金结构与龙头封板质量三指标（封单占流通市值 / 换手率 / 炸板次数）",
+        "slices": ["抱团度", "龙头质量"],
+    },
+    "handover": {
+        "label": "换龙接力分析师",
+        "focus": "梯队结构的承接力：中间层是否空心、2 板→3 板的晋级通道是否通畅",
+        # 判断"承接力"必须看每只票的封单占流通，**保留**明细
+        "slices": ["连板梯队", "炸板率"],
+    },
+    "sector": {
+        "label": "板块带动分析师",
+        "focus": "涨停股的板块分布与集中度（务必说明行业口径 ≠ 题材口径）",
+        "slices": ["行业分布", "连板梯队"],
+        "drop_ladder_detail": True,
+    },
+}
+
+
+def _trim_slice(slice_facts: dict, spec: dict) -> dict:
+    """按视角需要做**字段级**裁剪。
+
+    「事实包切片」分两层：
+      ① **板块级**：只给这个视角相关的板块（`slices`）
+      ② **字段级**：板块里过细的字段也可以砍掉（`drop_ladder_detail`）
+
+    连板梯队的 `明细` 里，每个高度每只票都带封单/换手/炸板 —— 对"情绪温度"
+    和"板块分布"这两个视角是纯噪音。砍掉它既省 token 又降噪。
+    """
+    if not spec.get("drop_ladder_detail"):
+        return slice_facts
+    import copy
+    out = copy.deepcopy(slice_facts)
+    lad = out.get("连板梯队")
+    if isinstance(lad, dict) and isinstance(lad.get("梯队"), dict):
+        for item in lad["梯队"].values():
+            if isinstance(item, dict):
+                item.pop("明细", None)
+    return out
 
 
 # ════════════════════════════════════════════════════════════
@@ -95,25 +156,25 @@ MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "2"))
 class ReplayState(TypedDict):
     """图的显式状态。
 
-    对比 my-first-agent：那里是一个模块级 `conversation` 列表 + 隐式约定。
-    这里每个字段都写明白。
-
     `Annotated[..., operator.add]` 叫 **reducer**，决定"多个节点写同一字段时怎样"：
-      · 带 reducer → **追加**（limitations / trace / usages / critique）
-      · 不带 reducer → **覆盖**（facts / report / revision）
-    本图有回环，`analyze` 会被执行多次 —— 若 `trace`、`usages` 不带 reducer，
-    第二次执行的记录就会把第一次的覆盖掉。
+      · 带 reducer → **追加**（limitations / trace / usages / critique / **findings**）
+      · 不带 reducer → **覆盖**（facts / digest / report / revision）
+
+    ⚠️ `findings` 是本图里 reducer **不可省**的字段：4 个分析师在**同一个超步**
+    里并行写它，没有 reducer 就会互相覆盖，最后只剩一份视角结论。
     """
 
     date: str
     facts: dict
     checks: dict
-    limitations: Annotated[list[str], operator.add]   # 追加
-    report: str                                        # 覆盖（每次重写替换）
-    critique: Annotated[list[dict], operator.add]      # 追加：每轮审查各一条
-    revision: int                                      # 覆盖：当前报告版本号（1 = 初稿）
-    usages: Annotated[list[dict], operator.add]        # 追加：每次 LLM 调用一条
-    trace: Annotated[list[dict], operator.add]         # 追加：可观测性
+    limitations: Annotated[list[str], operator.add]     # 追加
+    findings: Annotated[list[dict], operator.add]       # ★ 追加：4 个视角各写一条
+    digest: str                                          # 覆盖：主管汇总
+    report: str                                          # 覆盖：每次重写替换
+    critique: Annotated[list[dict], operator.add]        # 追加：每轮审查各一条
+    revision: int                                        # 覆盖：当前报告版本号
+    usages: Annotated[list[dict], operator.add]          # 追加：每次 LLM 调用一条
+    trace: Annotated[list[dict], operator.add]           # 追加：可观测性
 
 
 # ════════════════════════════════════════════════════════════
@@ -216,11 +277,98 @@ def _usage_of(message, role: str, version: int) -> dict:
 
 
 # ════════════════════════════════════════════════════════════
-#  节点 2：LLM 分析师（会被执行 1~MAX_REVISIONS 次）
+#  节点 2：4 个视角分析师（★ 并行扇出）
+# ════════════════════════════════════════════════════════════
+
+def _make_analyst_node(key: str, spec: dict):
+    """工厂：按视角配置生成一个分析节点函数。
+
+    每个节点都**只把自己那片切片**交给 LLM —— 这就是"事实包切片"的落地方式。
+    """
+    def node(state: ReplayState) -> dict:
+        t0 = time.time()
+        all_facts, all_checks = state["facts"], state["checks"]
+        slice_facts = _trim_slice(
+            {k: all_facts[k] for k in spec["slices"] if k in all_facts}, spec
+        )
+        slice_checks = {k: all_checks[k] for k in spec["slices"] if k in all_checks}
+
+        messages = [
+            SystemMessage(build_role_system(spec["label"], spec["focus"])),
+            HumanMessage(build_role_prompt(
+                state["date"], spec["label"], spec["focus"], slice_facts, slice_checks,
+            )),
+        ]
+        resp = _build_llm().invoke(messages)
+        usage = _usage_of(resp, f"analyst:{key}", 1)
+
+        slice_chars = len(json.dumps(slice_facts, ensure_ascii=False))
+        return {
+            "findings": [{
+                "analyst": key,
+                "label": spec["label"],
+                "focus": spec["focus"],
+                "slices_used": list(slice_facts),
+                "text": resp.content,
+            }],
+            "usages": [usage],
+            "trace": [{
+                "step": f"analyst:{key}",
+                "elapsed_s": round(time.time() - t0, 3),
+                "slices": len(slice_facts),
+                "slice_chars": slice_chars,
+                "prompt_chars": sum(len(str(m.content)) for m in messages),
+                "out_chars": len(resp.content),
+                "total_tokens": usage["total_tokens"],
+                "llm_calls": 1,
+            }],
+        }
+
+    node.__name__ = f"analyst_{key}"
+    return node
+
+
+# ════════════════════════════════════════════════════════════
+#  节点 3：Supervisor（★ 汇总扇入）
+# ════════════════════════════════════════════════════════════
+
+def supervisor(state: ReplayState) -> dict:
+    """汇总 4 份视角结论：找冲突 / 排优先级 / 指缺口。
+
+    刻意让它的输出**很短**（≤300 字）—— 它是"编排"节点，不是"写作"节点。
+    冲突点是后面报告里最有价值的部分：一个说"情绪退潮"、另一个说"极端抱团"，
+    这种张力不该被抹平。
+    """
+    t0 = time.time()
+    findings = state.get("findings") or []
+    messages = [
+        SystemMessage(SUPERVISOR_SYSTEM),
+        HumanMessage(build_supervisor_prompt(state["date"], findings)),
+    ]
+    resp = _build_llm().invoke(messages)
+    usage = _usage_of(resp, "supervisor", 1)
+
+    return {
+        "digest": resp.content,
+        "usages": [usage],
+        "trace": [{
+            "step": "supervisor",
+            "elapsed_s": round(time.time() - t0, 3),
+            "views_merged": len(findings),
+            "prompt_chars": sum(len(str(m.content)) for m in messages),
+            "out_chars": len(resp.content),
+            "total_tokens": usage["total_tokens"],
+            "llm_calls": 1,
+        }],
+    }
+
+
+# ════════════════════════════════════════════════════════════
+#  节点 4：Writer 执笔（会被执行 1~MAX_REVISIONS 次）
 # ════════════════════════════════════════════════════════════
 
 def analyze(state: ReplayState) -> dict:
-    """分析师节点：读事实包 → 写复盘报告。
+    """执笔节点：完整事实包 + 4 份视角结论 + 主管汇总 → 九节报告。
 
     若是重写（`critique` 非空），会把上一轮审查意见一并送进去，
     要求**逐条修掉**而不是整篇推倒重写。
@@ -230,21 +378,23 @@ def analyze(state: ReplayState) -> dict:
     version = state.get("revision", 0) + 1
 
     messages = [
-        SystemMessage(ANALYST_SYSTEM),
-        HumanMessage(build_user_prompt(
+        SystemMessage(WRITER_SYSTEM),
+        HumanMessage(build_writer_prompt(
             state["date"], state["facts"], state["checks"], state["limitations"],
+            findings=state.get("findings") or None,
+            digest=state.get("digest", ""),
             critique=prior or None,
         )),
     ]
     resp = _build_llm().invoke(messages)
-    usage = _usage_of(resp, "analyst", version)
+    usage = _usage_of(resp, "writer", version)
 
     return {
         "report": resp.content,
         "revision": version,
         "usages": [usage],
         "trace": [{
-            "step": f"analyze#{version}{'（重写）' if prior else ''}",
+            "step": f"writer#{version}{'（重写）' if prior else ''}",
             "elapsed_s": round(time.time() - t0, 3),
             "is_rewrite": bool(prior),
             "prompt_chars": sum(len(str(m.content)) for m in messages),
@@ -256,14 +406,14 @@ def analyze(state: ReplayState) -> dict:
 
 
 # ════════════════════════════════════════════════════════════
-#  节点 3：反方审查员（结构化输出）
+#  节点 5：反方审查员（结构化输出）
 # ════════════════════════════════════════════════════════════
 
 class _Finding(BaseModel):
     """一条审查发现。"""
     kind: str = Field(description="问题类型：数字不一致 / 比较方向 / 计数错误 / 漏免责声明 / 买卖措辞 / 无依据数字 / 断言超口径 / 其他")
     location: str = Field(description="报告中的位置：小节名 + 引用原句片段")
-    detail: str = Field(description="问题具体是什么")
+    detail: str = Field(description="问题具体是什么，计数类必须逐个列出你数到的东西")
     fix_hint: str = Field(description="可执行的修改方向")
 
 
@@ -273,6 +423,33 @@ class _Critique(BaseModel):
     summary: str = Field(description="一句话总评")
     findings: list[_Finding] = Field(default_factory=list,
                                      description="发现的问题列表；没有问题就留空数组")
+
+
+def _call_structured(messages) -> tuple[dict | None, Exception | None]:
+    """调用结构化输出，返回 `(out, last_err)`。做了两层兜底：
+
+    **① method 依次尝试**：`function_calling` → `json_mode`。
+    原因：langchain-openai 的 `with_structured_output` **默认 method 是
+    `json_schema`**，而 DeepSeek 不支持它，会报 400
+    "This response_format type is unavailable now"。
+
+    **② 同一 method 内重试一次**：实测偶发 `parsed=None`
+    （模型这一轮没返回 tool call），重试即可恢复。
+    """
+    last_err: Exception | None = None
+    for method in ("function_calling", "json_mode"):
+        for _ in range(2):                       # 每次 method 试 2 遍
+            try:
+                out = _build_llm().with_structured_output(
+                    _Critique, method=method, include_raw=True
+                ).invoke(messages)
+            except Exception as e:
+                last_err = e
+                break                            # 调用失败 → 换下一种 method
+            if out.get("parsed") is not None:
+                return out, None                 # 解析成功
+            last_err = None                      # 调用成功但解析失败 → 再试一遍
+    return None, last_err
 
 
 def critique(state: ReplayState) -> dict:
@@ -291,44 +468,20 @@ def critique(state: ReplayState) -> dict:
         )),
     ]
 
-    verdict: dict
-    usage: dict = {}
-    out, last_err = None, None
-
-    # ⚠️ 实测踩坑（跨厂商兼容性）：langchain-openai 的 `with_structured_output`
-    #    **默认 method 是 json_schema**，而 DeepSeek 不支持它，会报 400：
-    #        "This response_format type is unavailable now"
-    #    而 `function_calling` 方式是可用的。所以这里**显式指定**并按顺序兜底，
-    #    全部失败才降级 —— 绝不让一个"审查能力不可用"变成流程中断。
-    for method in ("function_calling", "json_mode"):
-        try:
-            out = _build_llm().with_structured_output(
-                _Critique, method=method, include_raw=True
-            ).invoke(messages)
-            break
-        except Exception as e:
-            last_err = e
-            out = None
+    out, last_err = _call_structured(messages)
 
     if out is None:                              # 所有方式都失败 → 降级但不断链
-        verdict = {
-            "ok": True,
-            "summary": f"⚠️ 审查降级：结构化输出失败"
-                       f"（{type(last_err).__name__}: {str(last_err)[:90]}）",
-            "findings": [], "degraded": True,
-        }
+        why = (f"{type(last_err).__name__}: {str(last_err)[:80]}" if last_err
+               else "调用成功但多次解析失败（模型未返回 tool call）")
+        verdict = {"ok": True, "summary": f"⚠️ 审查降级：{why}",
+                   "findings": [], "degraded": True}
+        usage: dict = {}
     else:
         msg = out.get("raw")
-        if msg is not None:
-            usage = _usage_of(msg, "critic", version)
+        usage = _usage_of(msg, "critic", version) if msg is not None else {}
         parsed = out.get("parsed")
-        if parsed is None:                       # 拿到了回复但解析失败 → 同样降级
-            verdict = {"ok": True,
-                       "summary": f"⚠️ 审查降级：结构化解析失败（{out.get('parsing_error')}）",
-                       "findings": [], "degraded": True}
-        else:
-            verdict = {"ok": parsed.ok, "summary": parsed.summary,
-                       "findings": [f.model_dump() for f in parsed.findings]}
+        verdict = {"ok": parsed.ok, "summary": parsed.summary,
+                   "findings": [f.model_dump() for f in parsed.findings]}
 
     verdict["reviewed_version"] = version
     return {
@@ -349,7 +502,8 @@ def critique(state: ReplayState) -> dict:
 def route_after_critique(state: ReplayState) -> str:
     """**条件边**：审查不过就打回重写，但受 MAX_REVISIONS 熔断。
 
-    这就是 `create_agent()` 里"循环"的本质 —— 一个函数根据状态决定下一步去哪。
+    重写**只回到 analyze（执笔）**，不重跑 4 个分析师 —— 审查意见针对的是成稿。
+    这就是 `create_agent()` 里"循环"的本质：一个函数根据状态决定下一步去哪。
     """
     if not state.get("critique"):
         return "end"
@@ -361,17 +515,31 @@ def route_after_critique(state: ReplayState) -> str:
 
 
 # ════════════════════════════════════════════════════════════
-#  建图：这几行就是 create_agent() 内部做的事
+#  建图
 # ════════════════════════════════════════════════════════════
 
 def build_graph():
     g = StateGraph(ReplayState)
     g.add_node("collect_facts", collect_facts)
+    g.add_edge(START, "collect_facts")        # 入口边：缺了它 compile() 会直接报错
+
+    # ★ 4 个视角分析师：collect_facts 完成后它们处于**同一个超步**，会并行执行
+    analyst_names = []
+    for key, spec in ROLE_SPECS.items():
+        name = f"analyst_{key}"
+        g.add_node(name, _make_analyst_node(key, spec))
+        g.add_edge("collect_facts", name)
+        analyst_names.append(name)
+
+    g.add_node("supervisor", supervisor)
+    # ★ 扇入：supervisor 等 4 个分析师全部完成才会被执行
+    for name in analyst_names:
+        g.add_edge(name, "supervisor")
+
     g.add_node("analyze", analyze)
     g.add_node("critique", critique)
 
-    g.add_edge(START, "collect_facts")
-    g.add_edge("collect_facts", "analyze")
+    g.add_edge("supervisor", "analyze")
     g.add_edge("analyze", "critique")
     # 条件边：critique 之后要么回到 analyze（重写），要么收工
     g.add_conditional_edges("critique", route_after_critique,
@@ -384,15 +552,21 @@ def build_graph():
 # ════════════════════════════════════════════════════════════
 
 def total_usage(usages: list[dict]) -> dict:
-    """把多次调用的用量加总（本图最多 2×analyze + 2×critique = 4 次）。"""
+    """把多次调用的用量加总，并**按角色**分组。"""
+    by_role: dict[str, dict] = {}
+    for u in usages:
+        r = u.get("role", "?")
+        d = by_role.setdefault(r, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+        d["calls"] += 1
+        for k in ("input_tokens", "output_tokens", "total_tokens"):
+            d[k] += u.get(k) or 0
     return {
         "calls": len(usages),
         "model": usages[0].get("model") if usages else None,
         "input_tokens": sum(u.get("input_tokens") or 0 for u in usages),
         "output_tokens": sum(u.get("output_tokens") or 0 for u in usages),
         "total_tokens": sum(u.get("total_tokens") or 0 for u in usages),
-        "breakdown": [{"role": u.get("role"), "version": u.get("version"),
-                       "total_tokens": u.get("total_tokens")} for u in usages],
+        "by_role": by_role,
     }
 
 
@@ -425,7 +599,7 @@ def save_artifacts(app, final: dict, date: str) -> list[Path]:
     OUT_DIR.mkdir(exist_ok=True)
     written: list[Path] = []
 
-    # 报告可能不存在（analyze 失败），此时跳过而不是写一个空文件
+    # 报告可能不存在（执笔失败），此时跳过而不是写一个空文件
     if final.get("report"):
         p = OUT_DIR / f"review-{date}.md"
         p.write_text(final["report"], encoding="utf-8")
@@ -437,6 +611,8 @@ def save_artifacts(app, final: dict, date: str) -> list[Path]:
         "facts": final.get("facts", {}),
         "checks": final.get("checks", {}),
         "limitations": final.get("limitations", []),
+        "findings": final.get("findings", []),
+        "digest": final.get("digest", ""),
         "revision": final.get("revision"),
         "critique": final.get("critique", []),
         "usage": total_usage(final.get("usages", [])),
@@ -473,8 +649,24 @@ def _diagnose(err: Exception) -> None:
         print(f"   {msg[:400]}")
 
 
+def _print_views(final: dict) -> None:
+    """打印 4 份视角结论 + 主管汇总 —— 这是多 Agent 协作最直观的部分。"""
+    findings = final.get("findings", [])
+    if not findings:
+        return
+    print(f"\n[视角结论] {len(findings)} 份（并行产出）")
+    for f in findings:
+        head = (f.get("text") or "").strip().splitlines()
+        first = next((l.strip(" -*") for l in head if l.strip()), "")
+        print(f"  · {f.get('label', f.get('analyst')):12} 切片={len(f.get('slices_used', []))}片  "
+              f"首条：{first[:56]}")
+    if final.get("digest"):
+        print("\n[主管汇总]")
+        for line in (final["digest"] or "").strip().splitlines()[:12]:
+            print(f"  {line}")
+
+
 def _print_review_chain(final: dict) -> None:
-    """把审查回路的过程单独打出来 —— 这是本项目最有观赏性的一段。"""
     critique = final.get("critique", [])
     if not critique:
         return
@@ -485,6 +677,10 @@ def _print_review_chain(final: dict) -> None:
         print(f"  {mark} 第{i}轮 审 v{c.get('reviewed_version')}{deg}：{c.get('summary', '')[:56]}")
         for f in c.get("findings", []):
             print(f"       · [{f.get('kind')}] {f.get('detail', '')[:74]}")
+    # 降级意味着"这一版其实没被审" —— 必须显式告警，不能让它静默通过
+    if critique[-1].get("degraded"):
+        print("\n  ⚠️ 注意：**最终一次审查降级了**，也就是说最后一版报告"
+              "未经实质审查。产物里的 `critique[].degraded` 记录了这一点。")
 
 
 def _print_run_summary(final: dict, elapsed: float) -> None:
@@ -492,18 +688,31 @@ def _print_run_summary(final: dict, elapsed: float) -> None:
     for step in final.get("trace", []):
         mark = "💰" if step.get("llm_calls") else "🧮"
         extra = {k: v for k, v in step.items() if k not in ("step", "elapsed_s")}
-        print(f"  {mark} {step['step']:16} {step['elapsed_s']:>6.3f}s  {extra}")
+        print(f"  {mark} {step['step']:18} {step['elapsed_s']:>6.3f}s  {extra}")
 
+    _print_views(final)
     _print_review_chain(final)
 
     u = total_usage(final.get("usages", []))
     print(f"\n[用量] {u['calls']} 次 LLM 调用  model={u['model']}  "
           f"in={u['input_tokens']}  out={u['output_tokens']}  total={u['total_tokens']}")
-    for b in u["breakdown"]:
-        print(f"        · {b['role']}#{b['version']}  {b['total_tokens']} tokens")
+    print("  按角色：")
+    for role, d in u["by_role"].items():
+        print(f"    · {role:22} {d['calls']} 次  in={d['input_tokens']:>6}  "
+              f"out={d['output_tokens']:>5}  total={d['total_tokens']:>6}")
     cost = estimate_cost(u)
     print("[费用] " + ("未配置单价（在 .env 里填 DEEPSEEK_PRICE_*_PER_M 即可估算）"
                       if cost is None else f"{cost} 元"))
+
+    # 切片效果：对比"全量事实包"与"各切片之和"
+    facts_chars = len(json.dumps(final.get("facts", {}), ensure_ascii=False))
+    slice_sum = sum(s.get("slice_chars", 0) for s in final.get("trace", [])
+                    if s.get("step", "").startswith("analyst:"))
+    if slice_sum:
+        print(f"\n[事实包切片] 全量 {facts_chars} 字符；4 份切片合计 {slice_sum} 字符"
+              f"（若人手一份全量则为 {facts_chars * len(ROLE_SPECS)} 字符，"
+              f"省 {100 - slice_sum * 100 // (facts_chars * len(ROLE_SPECS))}%）")
+
     print(f"\n[汇总] 工具调用 {sum(s.get('tools_called', 0) for s in final.get('trace', []))} 次，"
           f"LLM 调用 {u['calls']} 次，"
           f"局限 {len(final.get('limitations', []))} 条，总耗时 {elapsed:.2f}s")
@@ -522,9 +731,10 @@ def main() -> int:
     date = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATE
     app = build_graph()
 
-    print("=" * 70)
-    print(f"  反方审查员 + reflection 回路   复盘日 = {date}   最多重写 {MAX_REVISIONS - 1} 次")
-    print("=" * 70)
+    print("=" * 72)
+    print(f"  4 分析师并行扇出 + Supervisor + 审查回路   复盘日 = {date}"
+          f"   最多重写 {MAX_REVISIONS - 1} 次")
+    print("=" * 72)
     print("\n[图的 mermaid 定义]\n")
     print(app.get_graph().draw_mermaid())
 
@@ -532,14 +742,13 @@ def main() -> int:
     final: dict = {}
     try:
         # 用 stream_mode="values"：每个节点跑完都给一份**完整状态快照**。
-        # 好处很实际 —— 后面节点失败时，前面节点（取数）的成果不会丢。
-        # 对比 app.invoke()：一抛异常，前面所有成果一起没了（我们实测踩过）。
+        # 好处：后面节点失败时，前面节点（取数/分析师）的成果不会丢。
         for chunk in app.stream({"date": date}, stream_mode="values"):
             final = chunk
     except Exception as e:
         _diagnose(e)
         if final.get("trace"):
-            print("\n   ↳ 已完成节点的成果已保住，不重跑取数")
+            print("\n   ↳ 已完成节点的成果已保住，不重跑前面的步骤")
             _print_run_summary(final, time.time() - t0)
         print("\n[产物]（部分）")
         for f in save_artifacts(app, final, date):
