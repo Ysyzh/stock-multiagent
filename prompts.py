@@ -220,12 +220,17 @@ WRITER_SYSTEM = """你是 A 股短线复盘报告的**执笔人**，专长是**�
 def build_writer_prompt(date: str, facts: dict, checks: dict, limitations: list[str],
                         findings: list[dict] | None = None,
                         digest: str = "",
-                        critique: list[dict] | None = None) -> str:
+                        critique: list[dict] | None = None,
+                        human_notes: list[str] | None = None) -> str:
     """给执笔人的材料。
 
-    `critique` 非空时表示这是**重写**：把审查意见附上，要求逐条修掉。
+    `critique` / `human_notes` 非空时表示这是**重写**：把意见附上，要求逐条修掉。
     —— 这就是 reflection 回路的实质。不是让模型"再想想"，
        而是给它**上一版被明确指出的具体缺陷清单**。
+
+    两种重写来源语义不同，要分开放：
+      · `critique` = 自动审查员指出的问题（事实/逻辑/合规）
+      · `human_notes` = 人工审批人提出的要求（口径偏好、重点调整）
     """
     import json
 
@@ -268,6 +273,20 @@ def build_writer_prompt(date: str, facts: dict, checks: dict, limitations: list[
 
 **要求**：逐条修掉上述问题；其余已经正确的部分**保留，不要整篇推倒重写**，
 更不要丢失已经正确的数据。修改后仍须满足全部硬性规则（含文末免责声明）。
+"""
+
+    if human_notes:
+        items = [x for x in human_notes if x and x.strip()]
+        if items:
+            revision_block += f"""
+
+---
+
+# ⚠️ 人工审批人提出了以下修改要求，必须满足
+
+{chr(10).join(f'{i+1}. {x}' for i, x in enumerate(items))}
+
+这些是**人的直接要求**，优先级高于你自己的判断。同样保留其余已正确的部分。
 """
 
     return f"""# 复盘任务

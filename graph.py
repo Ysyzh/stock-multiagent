@@ -63,7 +63,9 @@ import operator
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
 import tools as T
@@ -90,6 +92,13 @@ TEMPERATURE = float(os.getenv("ANALYST_TEMPERATURE", "0.2"))
 # 最多生成几版报告（1 = 不重写）。这是最早的「步数熔断」雏形：
 # 没有它，审查员和执笔人可能互相不服，无限循环烧钱。
 MAX_REVISIONS = int(os.getenv("MAX_REVISIONS", "2"))
+# 人工确认关：默认开启。非交互环境（脚本/CI）会自动通过并打印告警。
+# 设为 0 可整体关闭这一关。
+HUMAN_REVIEW = os.getenv("HUMAN_REVIEW", "1") != "0"
+# 人工打回的**独立预算**。刻意与 MAX_REVISIONS 分开 ——
+# 实测踩到过：自动审查回路刚好用满额度时，route 用 revision 判熔断，
+# 导致**人的打回意见被无声忽略**。人和机器应该是两套预算。
+MAX_HUMAN_REWRITES = int(os.getenv("MAX_HUMAN_REWRITES", "2"))
 
 
 # ════════════════════════════════════════════════════════════
@@ -173,6 +182,9 @@ class ReplayState(TypedDict):
     report: str                                          # 覆盖：每次重写替换
     critique: Annotated[list[dict], operator.add]        # 追加：每轮审查各一条
     revision: int                                        # 覆盖：当前报告版本号
+    human_notes: Annotated[list[str], operator.add]      # ★ 追加：人工审批给出的修改意见
+    human_decision: str                                  # 覆盖：最近一次人工决定
+    human_rejects: int                                   # 覆盖：人工打回次数（独立于 revision）
     usages: Annotated[list[dict], operator.add]          # 追加：每次 LLM 调用一条
     trace: Annotated[list[dict], operator.add]           # 追加：可观测性
 
@@ -266,6 +278,9 @@ def _build_llm() -> ChatOpenAI:
 
 def _usage_of(message, role: str, version: int) -> dict:
     u = getattr(message, "usage_metadata", None) or {}
+    # 顺手记下 prompt 缓存命中量。实测 DeepSeek 会自动缓存公共前缀
+    # （writer 与 critic 共享大段 system prompt），命中部分通常不计费或大幅折扣。
+    details = u.get("input_token_details") or {}
     return {
         "role": role,
         "version": version,
@@ -273,6 +288,7 @@ def _usage_of(message, role: str, version: int) -> dict:
         "input_tokens": u.get("input_tokens"),
         "output_tokens": u.get("output_tokens"),
         "total_tokens": u.get("total_tokens"),
+        "cache_read": details.get("cache_read"),
     }
 
 
@@ -384,6 +400,7 @@ def analyze(state: ReplayState) -> dict:
             findings=state.get("findings") or None,
             digest=state.get("digest", ""),
             critique=prior or None,
+            human_notes=state.get("human_notes") or None,
         )),
     ]
     resp = _build_llm().invoke(messages)
@@ -503,14 +520,77 @@ def route_after_critique(state: ReplayState) -> str:
     """**条件边**：审查不过就打回重写，但受 MAX_REVISIONS 熔断。
 
     重写**只回到 analyze（执笔）**，不重跑 4 个分析师 —— 审查意见针对的是成稿。
-    这就是 `create_agent()` 里"循环"的本质：一个函数根据状态决定下一步去哪。
+    审查通过后进入**人工确认关**（`human_review`），这是企业级的关键动作：
+    「生成」和「发布」必须分开。
     """
     if not state.get("critique"):
-        return "end"
+        return "human"
     if state["critique"][-1].get("ok"):
-        return "end"
+        return "human"
     if state.get("revision", 1) >= MAX_REVISIONS:
-        return "end"          # 熔断：不能无限重写
+        return "human"        # 熔断：不能无限重写
+    return "rewrite"
+
+
+# ════════════════════════════════════════════════════════════
+#  节点 6：人工确认关（★ 阶段 5：interrupt 暂停/恢复）
+# ════════════════════════════════════════════════════════════
+#
+#  `interrupt()` 会**暂停整个图**并把 payload 交回调用方；调用方用
+#  `Command(resume=<答复>)` 恢复。这需要 **checkpointer** —— 没有它，
+#  状态无处保存，也就无法恢复。
+#
+#  为什么要有这个节点：**「生成报告」和「发布报告」是两件事。**
+#  自动生成再自动交付，在企业里是不可接受的（这份产物会被人当决策依据）。
+#  所以加一道人审：人可以 approve，也可以 reject 并写下具体修改意见，
+#  后者会让图**回到执笔人**按人的意见重写。
+
+def human_review(state: ReplayState) -> dict:
+    """出稿前的最后一道关。审批人可以看到：报告全文 + 最后一轮审查结论。"""
+    t0 = time.time()
+    last_critique = (state.get("critique") or [{}])[-1]
+    payload = {
+        "revision": state.get("revision"),
+        "reviewed_ok": last_critique.get("ok"),
+        "reviewed_degraded": last_critique.get("degraded", False),
+        "critic_summary": last_critique.get("summary", ""),
+        "report": state.get("report", ""),
+        "question": "报告可以交付吗？回复 approve 通过，或 reject:<修改意见> 打回重写",
+    }
+    # ★ 图在此暂停，直到调用方 Command(resume=...) 送回答复
+    answer = interrupt(payload)
+
+    decision = str(answer or "approve").strip()
+    approved = decision.lower().startswith(("approve", "y", "yes", "通过", "同意", "ok"))
+    note = "" if approved else decision.split(":", 1)[-1].strip()
+    rejects = state.get("human_rejects") or 0
+
+    return {
+        "human_decision": decision,
+        "human_notes": [note] if note else [],
+        "human_rejects": rejects if approved else rejects + 1,
+        "trace": [{
+            "step": f"human_review@v{state.get('revision')}",
+            "elapsed_s": round(time.time() - t0, 3),
+            "decision": "approve" if approved else "reject",
+            "reject_no": 0 if approved else rejects + 1,
+            "note_chars": len(note),
+            "llm_calls": 0,
+        }],
+    }
+
+
+def route_after_human(state: ReplayState) -> str:
+    """人工审批后的分流：通过就收工，打回就回执笔人按人的意见重写。
+
+    人工打回用**独立预算** `MAX_HUMAN_REWRITES`，不受自动审查回路的
+    `MAX_REVISIONS` 影响 —— 否则"自动审查刚好用满额度"会让人的意见被无声忽略。
+    """
+    decision = (state.get("human_decision") or "approve").lower()
+    if decision.startswith(("approve", "y", "yes", "通过", "同意", "ok")):
+        return "end"
+    if (state.get("human_rejects") or 0) > MAX_HUMAN_REWRITES:
+        return "end"          # 人工熔断：人也不能无限打回
     return "rewrite"
 
 
@@ -538,13 +618,20 @@ def build_graph():
 
     g.add_node("analyze", analyze)
     g.add_node("critique", critique)
+    g.add_node("human_review", human_review)
 
     g.add_edge("supervisor", "analyze")
     g.add_edge("analyze", "critique")
-    # 条件边：critique 之后要么回到 analyze（重写），要么收工
+    # 条件边：审查不过回到 analyze（重写），通过则进入人工确认关
     g.add_conditional_edges("critique", route_after_critique,
+                            {"rewrite": "analyze", "human": "human_review"})
+    # 人工确认关：通过收工，打回则回到 analyze 按人的意见重写
+    g.add_conditional_edges("human_review", route_after_human,
                             {"rewrite": "analyze", "end": END})
-    return g.compile()
+
+    # ★ 阶段 5：`interrupt()` 必须配 checkpointer —— 没有它状态无处保存，
+    #   图就无法"暂停→稍后恢复"。这里用内存版；生产应换 SqliteSaver/PostgresSaver。
+    return g.compile(checkpointer=MemorySaver())
 
 
 # ════════════════════════════════════════════════════════════
@@ -552,20 +639,26 @@ def build_graph():
 # ════════════════════════════════════════════════════════════
 
 def total_usage(usages: list[dict]) -> dict:
-    """把多次调用的用量加总，并**按角色**分组。"""
+    """把多次调用的用量加总，并**按角色**分组 + 统计 prompt 缓存命中。"""
     by_role: dict[str, dict] = {}
     for u in usages:
         r = u.get("role", "?")
-        d = by_role.setdefault(r, {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+        d = by_role.setdefault(r, {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                                   "total_tokens": 0, "cache_read": 0})
         d["calls"] += 1
-        for k in ("input_tokens", "output_tokens", "total_tokens"):
+        for k in ("input_tokens", "output_tokens", "total_tokens", "cache_read"):
             d[k] += u.get(k) or 0
+    inp = sum(u.get("input_tokens") or 0 for u in usages)
+    cached = sum(u.get("cache_read") or 0 for u in usages)
     return {
         "calls": len(usages),
         "model": usages[0].get("model") if usages else None,
-        "input_tokens": sum(u.get("input_tokens") or 0 for u in usages),
+        "input_tokens": inp,
         "output_tokens": sum(u.get("output_tokens") or 0 for u in usages),
         "total_tokens": sum(u.get("total_tokens") or 0 for u in usages),
+        "cache_read": cached,
+        # 命中率 = 缓存读到的 input / 全部 input（DeepSeek 对命中部分通常大幅折扣）
+        "cache_hit_rate": round(cached / inp * 100, 1) if inp else 0.0,
         "by_role": by_role,
     }
 
@@ -615,6 +708,15 @@ def save_artifacts(app, final: dict, date: str) -> list[Path]:
         "digest": final.get("digest", ""),
         "revision": final.get("revision"),
         "critique": final.get("critique", []),
+        # 人工审批的审计记录 —— "谁批的、批了什么、打回几次"必须留痕，
+        # 否则无法回答"这份报告被谁放行的"
+        "human": {
+            "decision": final.get("human_decision"),
+            "rejects": final.get("human_rejects", 0),
+            "notes": final.get("human_notes", []),
+            "auto_approved": (final.get("human_decision") or "").startswith("approve")
+                             and not (final.get("human_notes")),
+        },
         "usage": total_usage(final.get("usages", [])),
         "cost_yuan": estimate_cost(total_usage(final.get("usages", []))),
         "trace": final.get("trace"),
@@ -696,13 +798,16 @@ def _print_run_summary(final: dict, elapsed: float) -> None:
     u = total_usage(final.get("usages", []))
     print(f"\n[用量] {u['calls']} 次 LLM 调用  model={u['model']}  "
           f"in={u['input_tokens']}  out={u['output_tokens']}  total={u['total_tokens']}")
+    if u.get("cache_read"):
+        print(f"       prompt 缓存命中 {u['cache_read']} / {u['input_tokens']} 输入 tokens"
+              f"（命中率 {u['cache_hit_rate']}%，命中部分通常大幅折扣）")
     print("  按角色：")
     for role, d in u["by_role"].items():
         print(f"    · {role:22} {d['calls']} 次  in={d['input_tokens']:>6}  "
               f"out={d['output_tokens']:>5}  total={d['total_tokens']:>6}")
     cost = estimate_cost(u)
     print("[费用] " + ("未配置单价（在 .env 里填 DEEPSEEK_PRICE_*_PER_M 即可估算）"
-                      if cost is None else f"{cost} 元"))
+                      if cost is None else f"{cost} 元（未计缓存折扣，属保守上界）"))
 
     # 切片效果：对比"全量事实包"与"各切片之和"
     facts_chars = len(json.dumps(final.get("facts", {}), ensure_ascii=False))
@@ -716,6 +821,36 @@ def _print_run_summary(final: dict, elapsed: float) -> None:
     print(f"\n[汇总] 工具调用 {sum(s.get('tools_called', 0) for s in final.get('trace', []))} 次，"
           f"LLM 调用 {u['calls']} 次，"
           f"局限 {len(final.get('limitations', []))} 条，总耗时 {elapsed:.2f}s")
+
+
+def _ask_human(quest: dict) -> str:
+    """人工确认关：显示待审批内容并取得答复。
+
+    自动化环境（比如脚本/CI）里没有人可问 —— 这时**自动通过**，
+    但必须明确打印告警，**绝不假装"已经人工确认过了"**。
+    """
+    print("\n" + "=" * 72)
+    print("  ⏸  人工确认关 —— 图已暂停（`interrupt()` 生效）")
+    print("=" * 72)
+    print(f"  待交付报告版本：v{quest.get('revision')}")
+    print(f"  上一轮自动审查：{'通过' if quest.get('reviewed_ok') else '未通过或已降级'}"
+          f"{'（降级）' if quest.get('reviewed_degraded') else ''}")
+    print(f"  审查总评：{str(quest.get('critic_summary', ''))[:88]}")
+    print(f"  报告长度：{len(quest.get('report') or '')} 字符（全文见 out/ 产物）")
+
+    if HUMAN_REVIEW and sys.stdin.isatty():
+        print("\n  输入决定：`approve` 通过 / `reject:<修改意见>` 打回重写")
+        try:
+            ans = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            ans = "approve"
+        return ans or "approve"
+
+    why = ("HUMAN_REVIEW=0（人工确认已关闭）" if not HUMAN_REVIEW
+           else "非交互环境，没有终端可以问人")
+    print(f"\n  ⚠️ {why} → **自动通过**。"
+          f"这次并没有真正的人工确认，产物里 `human_decision` 会记为 auto-approve。")
+    return "approve"
 
 
 def main() -> int:
@@ -732,19 +867,35 @@ def main() -> int:
     app = build_graph()
 
     print("=" * 72)
-    print(f"  4 分析师并行扇出 + Supervisor + 审查回路   复盘日 = {date}"
-          f"   最多重写 {MAX_REVISIONS - 1} 次")
+    print(f"  4 分析师扇出 + Supervisor + 审查回路 + 人工确认   复盘日 = {date}")
+    print(f"  最多重写 {MAX_REVISIONS - 1} 次 / 人工确认 "
+          f"{'开启' if HUMAN_REVIEW else '关闭'}")
     print("=" * 72)
     print("\n[图的 mermaid 定义]\n")
     print(app.get_graph().draw_mermaid())
 
     t0 = time.time()
     final: dict = {}
+    # interrupt 的暂停/恢复必须绑定同一个 thread_id —— 状态靠它找回
+    thread = {"configurable": {"thread_id": f"review-{date}"}}
+    payload: dict | Command = {"date": date}
     try:
         # 用 stream_mode="values"：每个节点跑完都给一份**完整状态快照**。
         # 好处：后面节点失败时，前面节点（取数/分析师）的成果不会丢。
-        for chunk in app.stream({"date": date}, stream_mode="values"):
-            final = chunk
+        for _round in range(MAX_REVISIONS + 2):      # 兜底上限，防人工确认死循环
+            interrupted = None
+            for chunk in app.stream(payload, config=thread, stream_mode="values"):
+                final = chunk
+                if chunk.get("__interrupt__"):
+                    interrupted = chunk["__interrupt__"]
+            if not interrupted:
+                break
+            # ★ 图在这里暂停，等我们把答复送回去
+            item = interrupted[0]
+            quest = getattr(item, "value", item)
+            payload = Command(resume=_ask_human(quest if isinstance(quest, dict) else {}))
+        else:
+            print("\n⚠️ 人工确认轮次达到上限，强制收工")
     except Exception as e:
         _diagnose(e)
         if final.get("trace"):

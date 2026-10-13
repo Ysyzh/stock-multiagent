@@ -39,6 +39,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from langgraph.types import Command
+
 import graph as G
 from prompts import build_writer_prompt
 
@@ -174,8 +176,21 @@ def main() -> int:
     print(f"   节点数 = {len([n for n in app.get_graph().nodes if not n.startswith('__')])}")
 
     final: dict = {}
-    for chunk in app.stream({"date": "2026-10-12"}, stream_mode="values"):
-        final = chunk
+    # 图现在带 checkpointer + 人工确认关，所以必须给 thread_id，
+    # 并在遇到 interrupt 时送回答复（本测试自动通过人工关，专测自动回路）。
+    config = {"configurable": {"thread_id": "t-reflection"}}
+    payload = {"date": "2026-10-12"}
+    for _ in range(6):
+        interrupted = None
+        for chunk in app.stream(payload, config=config, stream_mode="values"):
+            final = chunk
+            if chunk.get("__interrupt__"):
+                interrupted = chunk["__interrupt__"]
+        if not interrupted:
+            break
+        payload = Command(resume="approve")
+    else:
+        raise RuntimeError("轮次超限")
 
     print("\n[执行轨迹]")
     for s in final.get("trace", []):
