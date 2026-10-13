@@ -237,7 +237,16 @@ def ladder(date: str = "2026-10-12") -> dict:
     by_lbc: dict[int, list[dict]] = {}
     for s in pool:
         by_lbc.setdefault(s["lbc"], []).append(
-            {"代码": s["c"], "名称": s["n"], "换手": round(s["hs"], 2), "炸板次数": s["zbc"]}
+            {
+                "代码": s["c"],
+                "名称": s["n"],
+                "换手": round(s["hs"], 2),
+                "炸板次数": s["zbc"],
+                "封单_亿": round(s["fund"] / 1e8, 2),
+                # 数值版留一份：下游要按它排序挑「最强/最弱」对比标的，
+                # 字符串 "7.06%" 没法排序。
+                "封单占流通_pct": round(s["fund"] / s["ltsz"] * 100, 2),
+            }
         )
 
     heights = sorted(by_lbc, reverse=True)
@@ -248,8 +257,12 @@ def ladder(date: str = "2026-10-12") -> dict:
     return _ok(
         {
             "最高板": top,
-            "梯队": {f"{h}板": {"家数": len(by_lbc[h]), "个股": [x["名称"] for x in by_lbc[h]]}
-                     for h in heights},
+            "梯队": {f"{h}板": {
+                "家数": len(by_lbc[h]),
+                "个股": [x["名称"] for x in by_lbc[h]],
+                # 明细带封单/换手/炸板，供下游挑「同高度强 vs 弱」对比标的
+                "明细": sorted(by_lbc[h], key=lambda x: x["封单占流通_pct"]),
+            } for h in heights},
             "首板家数": len(by_lbc.get(1, [])),
             "连板家数(≥2板)": sum(len(v) for k, v in by_lbc.items() if k >= 2),
             "高度断档": gaps,

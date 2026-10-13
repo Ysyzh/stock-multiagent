@@ -1,6 +1,8 @@
 # 环境变量（含 API Key，绝对不能提交）
 .env
 .env.*
+# 但 .env.example 必须入库 —— 它只放占位符，是新人的配置模板
+!.env.example
 
 # Python
 __pycache__/

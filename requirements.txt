@@ -1,0 +1,6 @@
+# 阶段 1（tools.py）只用 Python 标准库，无需安装任何东西。
+# 阶段 2 起需要以下依赖：
+langgraph
+langchain-openai
+python-dotenv
+rich
